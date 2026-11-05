@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Shared buckets</title>
+<style>
+  :root { --bg:#fafafa; --fg:#1a1a1a; --muted:#6b6b6b; --line:#ddd; --accent:#2457d6; --card:#fff; --onaccent:#fff; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#16171a; --fg:#ececec; --muted:#9a9a9a; --line:#33353a; --accent:#7ea3ff; --card:#1e2024; --onaccent:#101216; }
+  }
+  * { box-sizing: border-box; }
+  [hidden] { display:none !important; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:16px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 620px; margin: 0 auto; padding: 40px 20px 80px; }
+  h1 { font-size: 1.5rem; margin: 0 0 6px; word-break: break-all; }
+  p.sub { margin:0 0 20px; color:var(--muted); }
+  input[type=text] { width:100%; padding:12px; font:inherit; color:var(--fg); background:var(--card);
+         border:1px solid var(--line); border-radius:8px; }
+  input[type=text]:focus-visible { outline:2px solid var(--accent); border-color:transparent; }
+  .row { display:flex; gap:10px; margin-top:12px; }
+  button { font:inherit; font-weight:600; padding:10px 16px; border-radius:8px; cursor:pointer;
+           border:1px solid var(--accent); background:var(--accent); color:var(--onaccent); }
+  button.alt { background:transparent; color:var(--accent); }
+  button:focus-visible { outline:2px solid var(--fg); outline-offset:2px; }
+  .row button { flex:1; }
+  .bar { display:flex; gap:10px; margin:0 0 20px; }
+  .bar button { padding:6px 12px; font-size:.9rem; }
+  #drop { display:block; border:2px dashed var(--line); border-radius:10px; padding:32px 16px;
+          text-align:center; cursor:pointer; background:var(--card); color:var(--muted); }
+  #drop.over, #drop:focus-within { border-color: var(--accent); color: var(--fg); }
+  #drop input { position:absolute; opacity:0; width:1px; height:1px; }
+  #msg { min-height:1.5em; margin:10px 0 24px; font-size:.9rem; color:var(--muted); }
+  #msg.err { color:#d33; }
+  ul { list-style:none; margin:0; padding:0; border-top:1px solid var(--line); }
+  li { display:flex; align-items:center; gap:12px; padding:12px 0; border-bottom:1px solid var(--line); }
+  .info { flex:1; min-width:0; }
+  .name { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .meta { font-size:.8rem; color:var(--muted); }
+  a.dl { color:var(--accent); text-decoration:none; font-weight:600; }
+  a.dl:hover, a.dl:focus-visible { text-decoration:underline; }
+  button.del { background:none; border:none; padding:0; color:#d33; font:inherit; font-weight:600; cursor:pointer; }
+  button.del:hover, button.del:focus-visible { text-decoration:underline; }
+  .empty { color:var(--muted); padding:16px 0; }
+</style>
+</head>
+<body>
+<main>
+
+  <section id="home">
+    <h1>Shared buckets</h1>
+    <p class="sub">Pick a bucket name. Anyone who knows the name can upload to it and download from it.</p>
+    <label for="bname" class="sub" style="display:block;margin-bottom:6px">Bucket name</label>
+    <input type="text" id="bname" maxlength="40" autocomplete="off" autocapitalize="none" spellcheck="false"
+           placeholder="e.g. trip-photos-7f3k">
+    <div class="row">
+      <button id="create">Create bucket</button>
+      <button id="open" class="alt">Open bucket</button>
+    </div>
+    <div id="homemsg" class="sub" style="margin-top:12px" role="status"></div>
+    <p class="sub" style="font-size:.85rem">Use a long, hard-to-guess name for anything private. Names are 3–40 characters: lowercase letters, numbers and hyphens.</p>
+  </section>
+
+  <section id="room" hidden>
+    <h1 id="title"></h1>
+    <p class="sub">Share the link or the bucket name with people who should have access.</p>
+    <div class="bar">
+      <button class="alt" id="copy">Copy link</button>
+      <button class="alt" id="leave">Switch bucket</button>
+    </div>
+    <label id="drop">
+      <span>Click to choose a file, or drop it here</span>
+      <input type="file" id="file">
+    </label>
+    <div id="msg" role="status"></div>
+    <ul id="list"></ul>
+  </section>
+
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let bucket = null;
+
+const size = (b) => b > 1048576 ? (b/1048576).toFixed(1)+" MB" : Math.max(1, Math.round(b/1024))+" KB";
+const norm = (s) => s.trim().toLowerCase();
+const say = (el, t, err) => { el.textContent = t; el.style.color = err ? "#d33" : ""; };
+
+async function api(path, opts) {
+  const res = await fetch(path, opts);
+  const j = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(j.error || "Request failed");
+  return j;
+}
+
+function show(name) {
+  bucket = name;
+  $("home").hidden = !!name;
+  $("room").hidden = !name;
+  if (name) { $("title").textContent = name; say($("msg"), ""); loadFiles(); }
+}
+
+async function enter(mode) {
+  const name = norm($("bname").value);
+  say($("homemsg"), "");
+  try {
+    if (mode === "create") await api(`/api/b/${encodeURIComponent(name)}/create`, { method: "POST" });
+    else await api(`/api/b/${encodeURIComponent(name)}/files`);
+    location.hash = name;
+  } catch (e) { say($("homemsg"), e.message, true); }
+}
+
+async function loadFiles() {
+  const list = $("list");
+  try {
+    const files = await api(`/api/b/${encodeURIComponent(bucket)}/files`);
+    list.innerHTML = "";
+    if (!files.length) { list.innerHTML = '<div class="empty">Nothing here yet. Upload the first file.</div>'; return; }
+    for (const f of files) {
+      const li = document.createElement("li");
+      li.innerHTML = '<div class="info"><div class="name"></div><div class="meta"></div></div><a class="dl">Download</a><button class="del">Delete</button>';
+      li.querySelector(".name").textContent = f.name;
+      li.querySelector(".meta").textContent = size(f.size) + " · " + new Date(f.date).toLocaleString();
+      li.querySelector("a").href = `/api/b/${encodeURIComponent(bucket)}/download/${encodeURIComponent(f.key)}`;
+      li.querySelector(".del").onclick = () => removeFile(f);
+      list.appendChild(li);
+    }
+  } catch (e) {
+    list.innerHTML = "";
+    say($("msg"), e.message, true);
+  }
+}
+async function removeFile(f) {
+  if (!confirm(`Delete "${f.name}"? This can't be undone.`)) return;
+  try {
+    await api(`/api/b/${encodeURIComponent(bucket)}/files/${encodeURIComponent(f.key)}`, { method: "DELETE" });
+    say($("msg"), "Deleted " + f.name);
+    loadFiles();
+  } catch (e) { say($("msg"), e.message, true); }
+}
+
+async function send(file) {
+  if (!file) return;
+  say($("msg"), "Uploading " + file.name + "…");
+  const fd = new FormData(); fd.append("file", file);
+  try {
+    await api(`/api/b/${encodeURIComponent(bucket)}/upload`, { method: "POST", body: fd });
+    say($("msg"), "Uploaded " + file.name);
+    loadFiles();
+  } catch (e) { say($("msg"), e.message, true); }
+  $("file").value = "";
+}
+
+$("create").onclick = () => enter("create");
+$("open").onclick = () => enter("open");
+$("bname").addEventListener("keydown", (e) => { if (e.key === "Enter") enter("open"); });
+$("leave").onclick = () => { history.pushState("", "", location.pathname); show(null); };
+$("copy").onclick = async () => {
+  try { await navigator.clipboard.writeText(location.href); say($("msg"), "Link copied"); }
+  catch { say($("msg"), "Copy this link from the address bar", true); }
+};
+$("file").addEventListener("change", (e) => send(e.target.files[0]));
+const drop = $("drop");
+["dragenter","dragover"].forEach(t => drop.addEventListener(t, e => { e.preventDefault(); drop.classList.add("over"); }));
+["dragleave","drop"].forEach(t => drop.addEventListener(t, e => { e.preventDefault(); drop.classList.remove("over"); }));
+drop.addEventListener("drop", (e) => send(e.dataTransfer.files[0]));
+
+function route() {
+  const name = norm(decodeURIComponent(location.hash.slice(1)));
+  if (name) show(name); else show(null);
+}
+window.addEventListener("hashchange", route);
+route();
+</script>
+</body>
+</html>
