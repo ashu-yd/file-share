@@ -9,6 +9,7 @@ const STORE = process.env.BUCKET || "uploads"; // the one real Supabase bucket
 const MAX_MB = Number(process.env.MAX_MB || 10); // max size of one uploaded file
 const MAX_TEXT_MB = Number(process.env.MAX_TEXT_MB || 10); // max size of one text box
 const MAX_NOTES = Number(process.env.MAX_NOTES || 20); // text boxes per bucket
+const MAX_UPLOADS = Number(process.env.MAX_UPLOADS || 6); // file uploads handled at the same moment
 const MARKER = ".bucket"; // tiny file that proves a user bucket exists
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
@@ -27,10 +28,11 @@ app.set("trust proxy", 1);
 app.use(express.static("public"));
 
 /* ---------- Rate limiting ---------- */
-// General limit, plus a stricter limit on "bucket not found" answers
-// (this is what slows down people guessing bucket names).
+// Very generous general limit (a whole classroom can share one wifi/IP), a strict limit
+// on "bucket not found" answers (slows down name guessing) and on creating buckets.
 const hits = new Map();
 const misses = new Map();
+const creates = new Map();
 const recent = (map, ip) => {
   const now = Date.now();
   const arr = (map.get(ip) || []).filter((t) => now - t < 60_000);
@@ -40,11 +42,11 @@ const recent = (map, ip) => {
 app.use("/api", (req, res, next) => {
   res.set("Cache-Control", "no-store");
   recent(hits, req.ip).push(Date.now());
-  if (recent(hits, req.ip).length > 600 || recent(misses, req.ip).length > 30)
+  if (recent(hits, req.ip).length > 20000 || recent(misses, req.ip).length > 30)
     return res.status(429).json({ error: "Too many requests. Wait a minute." });
   next();
 });
-setInterval(() => { hits.clear(); misses.clear(); }, 10 * 60_000).unref();
+setInterval(() => { hits.clear(); misses.clear(); creates.clear(); }, 10 * 60_000).unref();
 
 const missing = (req, res) => {
   recent(misses, req.ip).push(Date.now());
@@ -56,6 +58,17 @@ const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: MAX_MB * 1024 * 1024 },
 });
+
+// Uploads are held in memory, so only allow a few at the same moment
+let uploading = 0;
+function limitUploads(req, res, next) {
+  if (uploading >= MAX_UPLOADS)
+    return res.status(503).json({ error: "The server is busy right now. Try again in a few seconds." });
+  uploading++;
+  let ended = false;
+  res.on("close", () => { if (!ended) { ended = true; uploading--; } });
+  next();
+}
 
 const cleanName = (n) => n.replace(/[^\w.\- ()]/g, "_").slice(0, 120) || "file";
 const validBucket = (b) => /^[a-z0-9][a-z0-9-]{2,39}$/.test(b);
@@ -86,12 +99,16 @@ async function exists(bucket) {
 const wrap = (fn) => (req, res) =>
   fn(req, res).catch((e) => {
     console.error(e);
-    res.status(500).json({ error: e.message || "Something went wrong" });
+    if (!res.headersSent) res.status(500).json({ error: e.message || "Something went wrong" });
   });
 
 /* ---------- Buckets ---------- */
 app.post("/api/b/:bucket/create", wrap(async (req, res) => {
   const { bucket } = req.params;
+  // stop one person from filling the storage with empty buckets
+  if (recent(creates, req.ip).length >= 10)
+    return res.status(429).json({ error: "You're creating buckets too fast. Wait a minute." });
+  recent(creates, req.ip).push(Date.now());
   if (await exists(bucket))
     return res.status(409).json({ error: "That name is taken. Pick another one." });
   const { error } = await store.upload(`${bucket}/${MARKER}`, Buffer.from("1"), {
@@ -124,7 +141,7 @@ app.get("/api/b/:bucket/files", wrap(async (req, res) => {
   );
 }));
 
-app.post("/api/b/:bucket/upload", upload.single("file"), wrap(async (req, res) => {
+app.post("/api/b/:bucket/upload", limitUploads, upload.single("file"), wrap(async (req, res) => {
   const { bucket } = req.params;
   if (!req.file) return res.status(400).json({ error: "No file received" });
   if (!(await exists(bucket))) return missing(req, res);
@@ -158,10 +175,15 @@ app.delete("/api/b/:bucket/files/:key", wrap(async (req, res) => {
 
 /* ---------- Live text boxes ----------
    Text lives in memory for instant live updates and is saved to Supabase
-   (bucket/notes/<id>.json) about a second after the last change.            */
-const rooms = new Map(); // bucket -> { notes: Map(id -> note), rev, last, ready }
+   (bucket/notes/<id>.json) shortly after the last change.
+   - Every box has a version number (v). Edits that were made on an old version
+     are refused with 409 so the browser can merge instead of overwriting.
+   - Browsers keep one "long poll" request open and get the answer the moment
+     something changes, so idle visitors cost almost nothing.                    */
+const rooms = new Map(); // bucket -> { notes, rev, base, last, waiters, notifyTimer, ready }
 
 const notePath = (bucket, id) => `${bucket}/notes/${id}.json`;
+const jsonBody = express.json({ limit: `${Math.ceil(MAX_TEXT_MB * 1.3)}mb` });
 
 function flush(bucket, id, note) {
   clearTimeout(note.timer);
@@ -190,7 +212,29 @@ function flush(bucket, id, note) {
 function schedulePersist(bucket, id, note) {
   note.dirty = true;
   clearTimeout(note.timer);
-  note.timer = setTimeout(() => flush(bucket, id, note), 800);
+  note.timer = setTimeout(() => flush(bucket, id, note), 1500);
+}
+
+// Wake up everyone waiting for news (grouped, so a fast typist doesn't flood everyone)
+function scheduleNotify(room) {
+  if (room.notifyTimer) return;
+  room.notifyTimer = setTimeout(() => {
+    room.notifyTimer = null;
+    for (const wake of [...room.waiters]) wake();
+  }, 250);
+}
+function changed(room, note) {
+  room.rev++;
+  if (note) { note.rev = room.rev; note.v++; }
+  scheduleNotify(room);
+}
+function waitForChange(room, res, ms) {
+  return new Promise((resolve) => {
+    const done = () => { clearTimeout(timer); room.waiters.delete(done); resolve(); };
+    const timer = setTimeout(done, ms);
+    room.waiters.add(done);
+    res.on("close", done);
+  });
 }
 
 async function loadNotes(bucket, room) {
@@ -199,21 +243,25 @@ async function loadNotes(bucket, room) {
     sortBy: { column: "name", order: "asc" },
   });
   if (error) throw error;
-  for (const f of data) {
-    if (!f.name.endsWith(".json")) continue;
-    const { data: blob, error: e2 } = await store.download(`${bucket}/notes/${f.name}`);
-    if (e2 || !blob) continue;
-    try {
-      const j = JSON.parse(await blob.text());
-      room.notes.set(f.name.slice(0, -5), { text: String(j.text || "") });
-    } catch { /* skip unreadable file */ }
-  }
+  await Promise.all(
+    data
+      .filter((f) => f.name.endsWith(".json"))
+      .map(async (f) => {
+        const { data: blob, error: e2 } = await store.download(`${bucket}/notes/${f.name}`);
+        if (e2 || !blob) return;
+        try {
+          const j = JSON.parse(await blob.text());
+          room.notes.set(f.name.slice(0, -5), { text: String(j.text || ""), v: 1, rev: room.base });
+        } catch { /* skip unreadable file */ }
+      })
+  );
 }
 
 function getRoom(bucket) {
   let room = rooms.get(bucket);
   if (!room) {
-    room = { notes: new Map(), rev: Date.now(), last: Date.now() };
+    const start = Date.now();
+    room = { notes: new Map(), rev: start, base: start, last: start, waiters: new Set(), notifyTimer: null };
     room.ready = loadNotes(bucket, room).catch((e) => {
       rooms.delete(bucket);
       throw e;
@@ -229,7 +277,7 @@ setInterval(() => {
   const now = Date.now();
   for (const [b, r] of rooms) {
     const busy = [...r.notes.values()].some((n) => n.dirty);
-    if (now - r.last > 30 * 60_000 && !busy) rooms.delete(b);
+    if (now - r.last > 30 * 60_000 && !busy && r.waiters.size === 0) rooms.delete(b);
   }
 }, 5 * 60_000).unref();
 
@@ -249,15 +297,23 @@ async function roomFor(req, res) {
   return getRoom(bucket);
 }
 
-// All text boxes. Pass ?since=<rev> to get a tiny "nothing changed" reply.
+// Text boxes. With ?since=<rev>&wait=1 the answer comes when something changes
+// (or after 25 seconds). Only boxes changed since <rev> are sent.
 app.get("/api/b/:bucket/notes", wrap(async (req, res) => {
   const room = await roomFor(req, res);
   if (!room) return;
-  if (String(room.rev) === req.query.since) return res.json({ rev: room.rev, same: true });
-  const notes = [...room.notes.entries()]
-    .sort((a, b) => (a[0] < b[0] ? -1 : 1))
-    .map(([id, n]) => ({ id, text: n.text }));
-  res.json({ rev: room.rev, notes });
+  const since = Number(req.query.since);
+  if (req.query.wait === "1" && since === room.rev) await waitForChange(room, res, 25_000);
+  if (since === room.rev) return res.json({ rev: room.rev, same: true });
+  const everything = !(since >= room.base);
+  const ids = [...room.notes.keys()].sort();
+  res.json({
+    rev: room.rev,
+    ids,
+    notes: ids
+      .filter((id) => everything || room.notes.get(id).rev > since)
+      .map((id) => ({ id, text: room.notes.get(id).text, v: room.notes.get(id).v })),
+  });
 }));
 
 app.post("/api/b/:bucket/notes", wrap(async (req, res) => {
@@ -266,31 +322,48 @@ app.post("/api/b/:bucket/notes", wrap(async (req, res) => {
   if (room.notes.size >= MAX_NOTES)
     return res.status(400).json({ error: `A bucket can have up to ${MAX_NOTES} text boxes.` });
   const id = `${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
-  const note = { text: "" };
+  const note = { text: "", v: 0, rev: 0 };
   room.notes.set(id, note);
-  room.rev++;
+  changed(room, note);
   schedulePersist(req.params.bucket, id, note);
   res.json({ id });
 }));
 
-app.put(
-  "/api/b/:bucket/notes/:id",
-  express.json({ limit: `${Math.ceil(MAX_TEXT_MB * 1.3)}mb` }),
-  wrap(async (req, res) => {
-    const room = await roomFor(req, res);
-    if (!room) return;
-    const note = room.notes.get(req.params.id);
-    if (!note) return res.status(404).json({ error: "This text box was deleted." });
-    const text = req.body && req.body.text;
-    if (typeof text !== "string") return res.status(400).json({ error: "Missing text" });
-    if (Buffer.byteLength(text) > MAX_TEXT_MB * 1024 * 1024)
-      return res.status(413).json({ error: `Text is larger than ${MAX_TEXT_MB} MB` });
-    note.text = text;
-    room.rev++;
-    schedulePersist(req.params.bucket, req.params.id, note);
-    res.json({ ok: true });
-  })
-);
+app.put("/api/b/:bucket/notes/:id", jsonBody, wrap(async (req, res) => {
+  const room = await roomFor(req, res);
+  if (!room) return;
+  const note = room.notes.get(req.params.id);
+  if (!note) return res.status(404).json({ error: "This text box was deleted." });
+  const { text, base } = req.body || {};
+  if (typeof text !== "string") return res.status(400).json({ error: "Missing text" });
+  if (Buffer.byteLength(text) > MAX_TEXT_MB * 1024 * 1024)
+    return res.status(413).json({ error: `Text is larger than ${MAX_TEXT_MB} MB` });
+  // Someone else changed this box since the sender last saw it: send the newest text back
+  if (base !== undefined && base !== note.v)
+    return res.status(409).json({ error: "This text box just changed.", text: note.text, v: note.v });
+  note.text = text;
+  changed(room, note);
+  schedulePersist(req.params.bucket, req.params.id, note);
+  res.json({ ok: true, v: note.v });
+}));
+
+// Add text on a new line at the end (used by photo-to-text). Safe with many people at once.
+app.post("/api/b/:bucket/notes/:id/append", jsonBody, wrap(async (req, res) => {
+  const room = await roomFor(req, res);
+  if (!room) return;
+  const note = room.notes.get(req.params.id);
+  if (!note) return res.status(404).json({ error: "This text box was deleted." });
+  const add = req.body && req.body.text;
+  if (typeof add !== "string" || !add.trim()) return res.status(400).json({ error: "Nothing to add" });
+  const joiner = note.text && !note.text.endsWith("\n") ? "\n" : "";
+  const next = note.text + joiner + add;
+  if (Buffer.byteLength(next) > MAX_TEXT_MB * 1024 * 1024)
+    return res.status(413).json({ error: `This text box is full (${MAX_TEXT_MB} MB). Add a new one.` });
+  note.text = next;
+  changed(room, note);
+  schedulePersist(req.params.bucket, req.params.id, note);
+  res.json({ ok: true, v: note.v });
+}));
 
 app.delete("/api/b/:bucket/notes/:id", wrap(async (req, res) => {
   const room = await roomFor(req, res);
@@ -301,7 +374,7 @@ app.delete("/api/b/:bucket/notes/:id", wrap(async (req, res) => {
   note.deleted = true;
   clearTimeout(note.timer);
   room.notes.delete(id);
-  room.rev++;
+  changed(room, null);
   if (note.flushing) await note.flushing;
   const { error } = await store.remove([notePath(bucket, id)]);
   if (error) throw error;
